@@ -54,6 +54,7 @@ class InputMetaData(RPC_PARAM):
     Args:
     block_tables (torch.Tensor, optional): Sequences' BlockTables Defaults to None.
     sequence_lengths (torch.Tensor): A tensor containing sequence lengths.
+    current_prompt_lengths (torch.Tensor): A tensor containing current prompt lengths.
     fd_inter_tensor (torch.Tensor, optional): A tensor representing intermediate data for flash decoding. Defaults to None.
     batch_size (int, optional): The current batch size. Defaults to 64.
     is_prompts (bool, optional): Indicates whether prefill or decoding. Defaults to False(decoding).
@@ -70,6 +71,7 @@ class InputMetaData(RPC_PARAM):
 
     block_tables: torch.Tensor = None
     sequence_lengths: torch.Tensor = None
+    current_prompt_lengths: torch.Tensor = None
     fd_inter_tensor: FDIntermTensors = None
     batch_size: int = 64  # current_batch_size
     is_prompts: bool = False
@@ -89,6 +91,7 @@ class InputMetaData(RPC_PARAM):
         return {
             "block_tables": self.block_tables.tolist(),
             "sequence_lengths": self.sequence_lengths.tolist(),
+            "current_prompt_lengths": self.current_prompt_lengths.tolist(),
             "batch_size": self.batch_size,
             "is_prompts": self.is_prompts,
             "use_cuda_kernel": self.use_cuda_kernel,
@@ -117,6 +120,9 @@ class InputMetaData(RPC_PARAM):
             sequence_lengths=torch.tensor(
                 rpc_dict["sequence_lengths"], dtype=torch.int, device=get_accelerator().get_current_device()
             ),
+            current_prompt_lengths=torch.tensor(
+                rpc_dict["current_prompt_lengths"], dtype=torch.int, device=get_accelerator().get_current_device()
+            ),
             batch_size=rpc_dict["batch_size"],
             is_prompts=rpc_dict["is_prompts"],
             use_cuda_kernel=rpc_dict["use_cuda_kernel"],
@@ -134,6 +140,7 @@ class InputMetaData(RPC_PARAM):
         return (
             f"InputMetaData(block_tables={self.block_tables}, "
             f"sequence_lengths={self.sequence_lengths}, "
+            f"current_prompt_lengths={self.current_prompt_lengths}, "
             f"fd_inter_tensor={self.fd_inter_tensor}, "
             f"batch_size={self.batch_size}, "
             f"is_prompts={self.is_prompts}, "
@@ -166,8 +173,9 @@ class InferenceConfig(RPC_PARAM):
         top_k (Optional[int]): The number of highest probability vocabulary tokens to keep for top-k-filtering, defaults to None.
         top_p (Optional[float]): The cumulative probability threshold for retaining tokens with a total probability above it, defaults to None.
         temperature (Optional[float]): Randomness used to control randomization, defaults to 1.0.
-        repetition_penalty (Optional[float]): The parameter that influences the model's treatment of new tokens in relation to their appearance in the prompt and the generated text. Values greater than 1 incentivize the model to introduce new tokens, whereas values less than 1 incentivize token repetition., defaults to 1.0.
         no_repeat_ngram_size (Optional[int]): If no_repeat_ngram_size > 0, the consecutive tokens of ngram size can only appear once in inference sentences.
+        repetition_penalty (Optional[float]): The parameter that influences the model's treatment of new tokens in relation to their appearance in the prompt and the generated text. Values greater than 1 incentivize the model to introduce new tokens, whereas values less than 1 incentivize token repetition., defaults to 1.0.
+        ignore_eos(bool): Whether to ignore the EOS token and continue generating tokens when encountering the EOS token.
         n_spec_tokens (int): The maximum number of speculating tokens, defaults to None.
         glimpse_large_kv (bool): Whether to use large KV in drafter model, defaults to False.
         block_size (int): The number of blocks in a logical block, defaults to 16.
@@ -176,10 +184,12 @@ class InferenceConfig(RPC_PARAM):
         micro_batch_size (int): the micro batch size, defaults to 1. Only useful when `pp_size` > 1.
         micro_batch_buffer_size (int): the buffer size for micro batch. Normally, it should be the same as the number of pipeline stages.
         use_cuda_kernel(bool): Whether to use cuda kernel, faster but lose some precision occasionally
+        high_precision(Optional[bool]): Whether to use float32 for underlying calculations of float16 data to achieve higher precision, defaults to False.
         use_cuda_graph (bool): Whether to enforce CUDA graph execution. If False, we will disable CUDA graph and always execute the model in eager mode. If True, we will use eager execution in hybrid.
         max_context_len_to_capture (int): max context len that could be captured by CUDA Graph, per sequence
-        high_precision(Optional[bool]): Whether to use float32 for underlying calculations of float16 data to achieve higher precision, defaults to False.
-        ignore_eos(bool): Whether to ignore the EOS token and continue generating tokens when encountering the EOS token.
+        enable_streamingllm(bool): Whether to use StreamingLLM, the relevant algorithms refer to the paper at https://arxiv.org/pdf/2309.17453 for implementation.
+        start_token_size(int): The size of the start_token, When using StreamingLLM.
+        generated_token_size(int): The size of the generated_token, When using StreamingLLM.
     """
 
     # NOTE: arrange configs according to their importance and frequency of usage
@@ -208,6 +218,7 @@ class InferenceConfig(RPC_PARAM):
     no_repeat_ngram_size: Optional[int] = 0
     repetition_penalty: Optional[float] = 1.0
     forced_eos_token_id: int = None
+    ignore_eos: bool = False
 
     # speculative decoding configs
     max_n_spec_tokens: int = 5
@@ -221,15 +232,19 @@ class InferenceConfig(RPC_PARAM):
     pp_size: int = 1
     micro_batch_size: int = 1
     micro_batch_buffer_size: int = None
-    high_precision: Optional[bool] = False
 
     # cuda kernel option
     use_cuda_kernel: bool = False
+    high_precision: Optional[bool] = False
 
     # cuda_graph
     use_cuda_graph: bool = False  # NOTE only when we have the graph for specific decoding batch size can we use the cuda graph for inference
     max_context_len_to_capture: int = 512
-    ignore_eos: bool = False
+
+    # StreamingLLM
+    enable_streamingllm: bool = False
+    start_token_size: int = 4
+    generated_token_size: int = 512
 
     def __post_init__(self):
         self.max_context_len_to_capture = self.max_input_len + self.max_output_len
@@ -271,6 +286,22 @@ class InferenceConfig(RPC_PARAM):
             assert (
                 "{input_text}" in self.prompt_template
             ), "The prompt template should contain '{input_text}' for formatting the input text. For example: 'USER: {input_text}\n\nASSISTANT: '"
+
+        if self.enable_streamingllm:
+            assert (
+                self.use_cuda_graph == False
+            ), "We currently do not support using streamingLLM and CUDA graph simultaneously."
+            assert (
+                self.max_input_len <= self.inference_config.generated_token_size
+            ), f"When enabling streamingLLM, max_input_len={self.max_input_len} must be less or equal than self.inference_config.generated_token_size={self.inference_config.generated_token_size}."
+            assert (
+                self.start_token_size <= self.block_size
+            ), f"According to the paper https://arxiv.org/pdf/2309.17453, the start_token_size greater than 4 has little impact on inference performance. Therefore, we assume that the start_token_size should be less or equal than the block_size={self.block_size}, but got {self.start_token_size}."
+            assert (
+                self.generated_token_size % self.block_size == 0
+            ), f"We assume that the generated_token_size should be a multiple of the block_size, got generated_token_size={self.generated_token_size}."
+            # We assume that start_token_size occupies one block.
+            self.start_token_size = self.block_size
 
     def to_generation_config(self, model_config) -> GenerationConfig:
         meta_config = {
