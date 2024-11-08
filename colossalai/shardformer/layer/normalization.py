@@ -9,7 +9,6 @@ import torch.nn as nn
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
-from colossalai.accelerator import get_accelerator
 from colossalai.lazy import LazyInitContext
 
 from ._operation import hook_parameter_in_backward
@@ -18,9 +17,10 @@ from .utils import SeqParallelUtils
 SUPPORT_NPU = False
 try:
     import torch_npu
+
     SUPPORT_NPU = True
     warnings.warn("support npu")
-except Exception as e:
+except Exception:
     warnings.warn("support gpu")
 
 
@@ -50,6 +50,7 @@ except ImportError:
 
 FusedRMSNormWithHook = None
 if SUPPORT_NPU:
+
     class NPUFusedRMSNormWithHook(nn.Module):
         def __init__(self, normalized_shape, eps=0.00001, elementwise_affine=True):
             super().__init__()
