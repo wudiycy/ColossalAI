@@ -6,14 +6,23 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
-import torch_npu
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
+from colossalai.accelerator import get_accelerator
 from colossalai.lazy import LazyInitContext
 
 from ._operation import hook_parameter_in_backward
 from .utils import SeqParallelUtils
+
+SUPPORT_NPU = False
+try:
+    import torch_npu
+    SUPPORT_NPU = True
+    warnings.warn("support npu")
+except Exception as e:
+    warnings.warn("support gpu")
+
 
 __all__ = ["FusedLayerNorm", "FusedRMSNorm", "LayerNorm", "RMSNorm", "BaseLayerNorm"]
 
@@ -36,7 +45,12 @@ try:
             output = hook_parameter_in_backward(output, self.weight, self.bias)
             return output
 
-    class FusedRMSNormWithHook(nn.Module):
+except ImportError:
+    warnings.warn("Please install apex from source (https://github.com/NVIDIA/apex) to use the fused RMSNorm kernel")
+
+FusedRMSNormWithHook = None
+if SUPPORT_NPU:
+    class NPUFusedRMSNormWithHook(nn.Module):
         def __init__(self, normalized_shape, eps=0.00001, elementwise_affine=True):
             super().__init__()
             if isinstance(normalized_shape, numbers.Integral):
@@ -59,8 +73,20 @@ try:
             output = hook_parameter_in_backward(output, self.weight)
             return output
 
-except ImportError:
-    warnings.warn("Please install apex from source (https://github.com/NVIDIA/apex) to use the fused RMSNorm kernel")
+    FusedRMSNormWithHook = NPUFusedRMSNormWithHook
+else:
+    from apex.normalization import FusedRMSNorm as ApexFusedRMSNorm
+
+    class CUDAFusedRMSNormWithHook(ApexFusedRMSNorm):
+        def __init__(self, normalized_shape, eps=0.00001, elementwise_affine=True):
+            super().__init__(normalized_shape, eps, elementwise_affine)
+
+        def forward(self, input):
+            output = super().forward(input)
+            output = hook_parameter_in_backward(output, self.weight)
+            return output
+
+    FusedRMSNormWithHook = CUDAFusedRMSNormWithHook
 
 FAST_LAYERNORM_SUPPORTED_SIZE = [
     1024,
