@@ -15,6 +15,18 @@ body:
     options:
     - label: I have searched the existing issues
       required: true
+
+- type: dropdown
+  id: share_script
+  attributes:
+    label: Do you feel comfortable sharing a succinct (minimal) script that reproduces the error? :)
+    description: If not, please share your setting/training config, and point to the line in the repo that throws the error if applicable.
+    options:
+      - Yes, I will share a minimal reproducible script.
+      - No, I prefer not to share.
+  validations:
+    required: true
+
 - type: textarea
   attributes:
     label: 🐛 Describe the bug
